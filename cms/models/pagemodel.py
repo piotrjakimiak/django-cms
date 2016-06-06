@@ -157,7 +157,7 @@ class Page(six.with_metaclass(PageMetaClass, MP_Node)):
 
         if site:
             # Filter out any nodes not belonging to provided site.
-            nodes = nodes.filter(site=site)
+            nodes = nodes.on_site(site)
 
         if position is None:
             # No position has been given.
@@ -168,7 +168,7 @@ class Page(six.with_metaclass(PageMetaClass, MP_Node)):
 
     def is_dirty(self, language):
         state = self.get_publisher_state(language)
-        return state == PUBLISHER_STATE_DIRTY or state == PUBLISHER_STATE_PENDING
+        return state in (PUBLISHER_STATE_DIRTY, PUBLISHER_STATE_PENDING)
 
     def get_absolute_url(self, language=None, fallback=True):
         if not language:
@@ -218,7 +218,7 @@ class Page(six.with_metaclass(PageMetaClass, MP_Node)):
             self.template == constants.TEMPLATE_INHERITANCE_MAGIC)
         target_public_page = None
 
-        if position in ('left', 'right') and not target.parent:
+        if position in ('left', 'right') and not target.parent_id:
             # make sure move_page does not break the tree
             # when moving to a top level position.
 
@@ -244,17 +244,14 @@ class Page(six.with_metaclass(PageMetaClass, MP_Node)):
                 # position and so can't inherit from anything.
                 self.template = self.get_template()
 
-        if position == 'first-child' or position == 'last-child':
+        if position in ('first-child', 'last-child'):
             self.parent_id = target.pk
         else:
             self.parent_id = target.parent_id
 
         self.save()
 
-        if target_public_page:
-            moved_page = self.move(target_public_page, pos=position)
-        else:
-            moved_page = self.move(target, pos=position)
+        moved_page = self.move(target_public_page or target, pos=position)
 
         # fire signal
         import cms.signals as cms_signals
@@ -401,20 +398,14 @@ class Page(six.with_metaclass(PageMetaClass, MP_Node)):
         that are specific to an exact instance.
         :param target: The Page to copy the attributes to
         """
+        attributes_to_copy = [
+            'login_required', 'in_navigation', 'soft_root', 'limit_visibility_in_menu',
+            'navigation_extenders', 'application_urls', 'application_namespace',
+            'template', 'site_id', 'xframe_options']
         if not clean:
-            target.publication_date = self.publication_date
-            target.publication_end_date = self.publication_end_date
-            target.reverse_id = self.reverse_id
-        target.login_required = self.login_required
-        target.in_navigation = self.in_navigation
-        target.soft_root = self.soft_root
-        target.limit_visibility_in_menu = self.limit_visibility_in_menu
-        target.navigation_extenders = self.navigation_extenders
-        target.application_urls = self.application_urls
-        target.application_namespace = self.application_namespace
-        target.template = self.template
-        target.site_id = self.site_id
-        target.xframe_options = self.xframe_options
+            attributes_to_copy += ['publication_date', 'publication_end_date', 'reverse_id']
+        for attr in attributes_to_copy:
+            setattr(target, attr, getattr(self, attr))
 
     def copy_page(self, target, site, position='first-child',
                   copy_permissions=True):
@@ -432,16 +423,13 @@ class Page(six.with_metaclass(PageMetaClass, MP_Node)):
             raise PublicIsUnmodifiable("copy page is not allowed for public pages")
         pages = list(self.get_descendants(True).order_by('path'))
         site_reverse_ids = Page.objects.filter(site=site, reverse_id__isnull=False).values_list('reverse_id', flat=True)
+        tree = []
         if target:
             target.old_pk = -1
             if position == "first-child" or position == "last-child":
                 tree = [target]
             elif target.parent_id:
                 tree = [target.parent]
-            else:
-                tree = []
-        else:
-            tree = []
         if tree:
             tree[0].old_pk = tree[0].pk
         first = True
@@ -611,12 +599,7 @@ class Page(six.with_metaclass(PageMetaClass, MP_Node)):
                 old_page = Page.objects.get(pk=self.pk)
             except Page.DoesNotExist:
                 return True
-            for field in fields:
-                old_val = getattr(old_page, field)
-                new_val = getattr(self, field)
-                if not old_val == new_val:
-                    return True
-            return False
+            return all(getattr(old_page, field) == getattr(self, field) for field in fields)
         return True
 
     def is_published(self, language, force_reload=False):
@@ -707,9 +690,6 @@ class Page(six.with_metaclass(PageMetaClass, MP_Node)):
             menu_pool.clear(site_id=self.site_id)
             self.publisher_public = public_page
             published = True
-        else:
-            # Nothing left to do
-            pass
         if not published:
             self.set_publisher_state(language, PUBLISHER_STATE_PENDING, published=True)
         self._publisher_keep_state = True
@@ -1317,27 +1297,17 @@ class Page(six.with_metaclass(PageMetaClass, MP_Node)):
 
     def get_previous_filtered_sibling(self, **filters):
         filters.update({
-            'publisher_is_draft': self.publisher_is_draft
-        })
-        filters.update({
+            'publisher_is_draft': self.publisher_is_draft,
             'site__id': self.site_id
         })
-        try:
-            return self.get_siblings().filter(path__lt=self.path, **filters).reverse()[0]
-        except IndexError:
-            return None
+        return self.get_siblings().filter(path__lt=self.path, **filters).reverse().first()
 
     def get_next_filtered_sibling(self, **filters):
         filters.update({
-            'publisher_is_draft': self.publisher_is_draft
-        })
-        filters.update({
+            'publisher_is_draft': self.publisher_is_draft,
             'site__id': self.site_id
         })
-        try:
-            return self.get_siblings().filter(path__gt=self.path, **filters)[0]
-        except IndexError:
-            return None
+        return self.get_siblings().filter(path__gt=self.path, **filters).first()
 
     def _publisher_save_public(self, obj):
         """Mptt specific stuff before the object can be saved, overrides
@@ -1365,16 +1335,14 @@ class Page(six.with_metaclass(PageMetaClass, MP_Node)):
             if not self.parent_id:
                 obj.parent_id = None
                 self.add_sibling(pos='right', instance=obj)
-            else:
-                if public_prev_sib:
-                    obj.parent_id = public_prev_sib.parent_id
-                    public_prev_sib.add_sibling(pos='right', instance=obj)
-                else:
-                    if public_parent:
-                        obj.parent_id = public_parent.pk
-                        obj.parent = public_parent
-                        obj = obj.add_root(instance=obj)
-                        obj = obj.move(target=public_parent, pos='first-child')
+            elif public_prev_sib:
+                obj.parent_id = public_prev_sib.parent_id
+                public_prev_sib.add_sibling(pos='right', instance=obj)
+            elif public_parent:
+                obj.parent_id = public_parent.pk
+                obj.parent = public_parent
+                obj = obj.add_root(instance=obj)
+                obj = obj.move(target=public_parent, pos='first-child')
         else:
             # check if object was moved / structural tree change
             prev_public_sibling = obj.get_previous_filtered_sibling()
@@ -1509,11 +1477,11 @@ class Page(six.with_metaclass(PageMetaClass, MP_Node)):
                 raise
             current_revision = current_version.revision
         try:
-            previous_version = versions.filter(revision__pk__gt=current_revision.pk).order_by('pk')[0]
+            next_version = versions.filter(revision__pk__gt=current_revision.pk).order_by('pk')[0]
         except IndexError as e:
             e.message = "no next revision found"
             raise
-        next_revision = previous_version.revision
+        next_revision = next_version.revision
 
         clean = self._apply_revision(next_revision)
         return Page.objects.get(pk=self.pk), clean
